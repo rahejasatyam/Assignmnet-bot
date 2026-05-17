@@ -105,13 +105,13 @@ async def lifespan(app: FastAPI):
         
         # Build index if it doesn't exist yet
         from pathlib import Path
-        index_path = Path("index/faiss.index")
+        index_path = Path("index/tfidf.pkl")
         if not index_path.exists():
-            log.info("FAISS index not found. Building from catalog...")
+            log.info("TF-IDF index not found. Building from catalog...")
             build_index()
         
         _ensure_loaded()
-        log.info("FAISS index and embedding model pre-loaded. Ready.")
+        log.info("TF-IDF index pre-loaded. Ready.")
     except Exception as e:
         log.error(f"Failed to pre-load retriever: {e}")
         log.warning("Server will start but first requests may be slow.")

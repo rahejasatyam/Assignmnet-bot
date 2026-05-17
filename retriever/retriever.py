@@ -1,25 +1,21 @@
 """
 retriever/retriever.py
 ======================
-Semantic search over the SHL catalog using sentence-transformers + FAISS.
+Semantic search over the SHL catalog using lightweight TF-IDF.
 
 Design decisions:
-- Model: all-MiniLM-L6-v2 (384-dim, fast, free, strong retrieval quality).
-  Chosen over larger models because speed matters (30s API timeout) and
-  the catalog is small enough that a lighter model is sufficient.
-- Index: FAISS IndexFlatIP with L2-normalized vectors = cosine similarity.
-  "Flat" (brute-force) is fine for <500 items; no approximation needed.
+- Model: TF-IDF vectorizer + cosine similarity (via scikit-learn).
+  Extremely lightweight, uses <200MB RAM, fast enough for 500 items.
 - Embedding document: concatenate name + description + test_types + job_levels
   so the search captures all relevant signals per assessment.
-- Index is persisted to disk so it is NOT rebuilt on every server start (cold
-  start would be too slow on Render free tier).
+- Index is persisted to disk using pickle so it is NOT rebuilt on every server start.
 - Thread-safe: model and index are loaded once at module import time
   (singleton pattern) and are read-only during search.
 """
 
 import json
 import logging
-import os
+import pickle
 from pathlib import Path
 from typing import Optional
 
@@ -31,12 +27,12 @@ log = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).parent.parent
 CATALOG_PATH = PROJECT_ROOT / "data" / "catalog.json"
 INDEX_DIR = PROJECT_ROOT / "index"
-INDEX_PATH = INDEX_DIR / "faiss.index"
+INDEX_PATH = INDEX_DIR / "tfidf.pkl"
 METADATA_PATH = INDEX_DIR / "metadata.json"
 
 # ── Lazy globals (loaded once) ─────────────────────────────────────────────────
-_model = None          # SentenceTransformer model
-_index = None          # faiss.Index
+_vectorizer = None     # TfidfVectorizer
+_tfidf_matrix = None   # Sparse matrix of tf-idf vectors
 _catalog: list[dict] = []   # full assessment dicts, aligned with index rows
 
 
@@ -68,7 +64,7 @@ def _build_document(assessment: dict) -> str:
 
     name = assessment.get("name", "")
     if name:
-        # Repeat name twice to up-weight it during embedding
+        # Repeat name twice to up-weight it during TF-IDF
         parts.append(name)
         parts.append(name)
 
@@ -83,35 +79,24 @@ def _build_document(assessment: dict) -> str:
 
     desc = assessment.get("description", "")
     if desc:
-        parts.append(desc[:500])  # cap to avoid token overflow
+        parts.append(desc[:500])  # cap to avoid term bloat
 
-    return " | ".join(parts)
-
-
-def _load_model():
-    """Load the sentence-transformer model (lazy, singleton)."""
-    global _model
-    if _model is None:
-        from sentence_transformers import SentenceTransformer
-        log.info("Loading embedding model all-MiniLM-L6-v2 ...")
-        _model = SentenceTransformer("all-MiniLM-L6-v2")
-        log.info("Embedding model loaded.")
-    return _model
+    return " ".join(parts)
 
 
 def build_index(force: bool = False) -> None:
     """
-    Embed the catalog and save a FAISS index to disk.
+    Build TF-IDF vectors for the catalog and save to disk.
 
     Args:
         force: If True, rebuild even if index already exists on disk.
     """
-    import faiss
+    from sklearn.feature_extraction.text import TfidfVectorizer
 
-    global _catalog, _index
+    global _catalog, _vectorizer, _tfidf_matrix
 
     if not force and INDEX_PATH.exists() and METADATA_PATH.exists():
-        log.info("FAISS index already exists. Skipping build (use force=True to rebuild).")
+        log.info("TF-IDF index already exists. Skipping build (use force=True to rebuild).")
         return
 
     # Load catalog
@@ -123,49 +108,37 @@ def build_index(force: bool = False) -> None:
     with open(CATALOG_PATH, "r", encoding="utf-8") as f:
         catalog = json.load(f)
 
-    log.info(f"Building FAISS index for {len(catalog)} assessments ...")
+    log.info(f"Building TF-IDF index for {len(catalog)} assessments ...")
 
-    # Build embedding documents
+    # Build document strings
     documents = [_build_document(a) for a in catalog]
 
-    # Embed
-    model = _load_model()
-    embeddings = model.encode(
-        documents,
-        batch_size=64,
-        show_progress_bar=True,
-        normalize_embeddings=True,  # L2 normalize → inner product = cosine sim
-        convert_to_numpy=True,
-    )
-
-    embeddings = embeddings.astype(np.float32)
-    dim = embeddings.shape[1]
-
-    # Create FAISS flat index (exact cosine via inner product on normalized vecs)
-    index = faiss.IndexFlatIP(dim)
-    index.add(embeddings)
+    # Vectorize
+    vectorizer = TfidfVectorizer(stop_words='english', max_features=10000)
+    tfidf_matrix = vectorizer.fit_transform(documents)
 
     # Persist
     INDEX_DIR.mkdir(parents=True, exist_ok=True)
-    faiss.write_index(index, str(INDEX_PATH))
+    with open(INDEX_PATH, "wb") as f:
+        pickle.dump({"vectorizer": vectorizer, "matrix": tfidf_matrix}, f)
     
-    # Save metadata (the catalog list, aligned with index rows)
+    # Save metadata (the catalog list, aligned with matrix rows)
     with open(METADATA_PATH, "w", encoding="utf-8") as f:
         json.dump(catalog, f, indent=2, ensure_ascii=False)
 
-    log.info(f"FAISS index saved: {INDEX_PATH} ({index.ntotal} vectors, dim={dim})")
+    log.info(f"TF-IDF index saved: {INDEX_PATH} ({tfidf_matrix.shape[0]} documents)")
 
     # Update in-memory globals
-    _index = index
+    _vectorizer = vectorizer
+    _tfidf_matrix = tfidf_matrix
     _catalog = catalog
 
 
 def _ensure_loaded() -> None:
     """Load index and catalog from disk if not already in memory."""
-    global _model, _index, _catalog
-    import faiss
+    global _vectorizer, _tfidf_matrix, _catalog
 
-    if _index is not None and _catalog:
+    if _vectorizer is not None and _tfidf_matrix is not None and _catalog:
         return  # already loaded
 
     if not INDEX_PATH.exists() or not METADATA_PATH.exists():
@@ -173,19 +146,21 @@ def _ensure_loaded() -> None:
         build_index()
         return
 
-    log.info("Loading FAISS index from disk ...")
-    _index = faiss.read_index(str(INDEX_PATH))
+    log.info("Loading TF-IDF index from disk ...")
+    with open(INDEX_PATH, "rb") as f:
+        data = pickle.load(f)
+        _vectorizer = data["vectorizer"]
+        _tfidf_matrix = data["matrix"]
 
     with open(METADATA_PATH, "r", encoding="utf-8") as f:
         _catalog = json.load(f)
 
-    _load_model()  # ensure model is loaded for future queries
-    log.info(f"Index loaded: {_index.ntotal} vectors.")
+    log.info(f"Index loaded: {_tfidf_matrix.shape[0]} documents.")
 
 
 def search(query: str, k: int = 10) -> list[dict]:
     """
-    Semantic search over the SHL catalog.
+    Keyword/TF-IDF search over the SHL catalog.
 
     Args:
         query: Natural language query string.
@@ -195,31 +170,36 @@ def search(query: str, k: int = 10) -> list[dict]:
         List of assessment dicts (full catalog data), ordered by relevance.
         Each dict is a deep copy so callers can mutate safely.
     """
+    from sklearn.metrics.pairwise import cosine_similarity
     _ensure_loaded()
 
     if not query or not query.strip():
         log.warning("Empty query passed to search().")
         return []
 
-    model = _load_model()
+    # Vectorize the query
+    query_vec = _vectorizer.transform([query.strip()])
 
-    # Embed the query (must also be L2-normalized to match index)
-    query_vec = model.encode(
-        [query.strip()],
-        normalize_embeddings=True,
-        convert_to_numpy=True,
-    ).astype(np.float32)
+    # Compute cosine similarity
+    similarities = cosine_similarity(query_vec, _tfidf_matrix).flatten()
 
-    # FAISS search — returns distances and indices
-    k_actual = min(k, _index.ntotal)
-    distances, indices = _index.search(query_vec, k_actual)
+    # Get top k indices sorted by similarity (descending)
+    k_actual = min(k, len(_catalog))
+    # argpartition is faster than argsort for top-k, then sort those k
+    if k_actual < len(similarities):
+        top_indices = np.argpartition(similarities, -k_actual)[-k_actual:]
+        # sort the top k by score
+        top_indices = top_indices[np.argsort(-similarities[top_indices])]
+    else:
+        top_indices = np.argsort(-similarities)
 
     results = []
-    for dist, idx in zip(distances[0], indices[0]):
-        if idx < 0:  # FAISS returns -1 for empty slots
+    for idx in top_indices:
+        score = float(similarities[idx])
+        if score <= 0.0:  # Skip completely irrelevant results
             continue
         assessment = dict(_catalog[idx])  # shallow copy per item
-        assessment["_score"] = float(dist)  # attach cosine similarity score
+        assessment["_score"] = score  # attach cosine similarity score
         results.append(assessment)
 
     return results
