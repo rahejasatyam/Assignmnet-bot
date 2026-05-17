@@ -9,7 +9,7 @@ lxml==5.2.1
 
 # Embeddings & Vector Store
 sentence-transformers==2.7.0
-faiss-cpu==1.7.4
+faiss-cpu==1.13.2
 numpy==1.26.4
 
 # LLM
