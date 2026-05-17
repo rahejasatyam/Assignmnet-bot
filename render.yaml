@@ -1,0 +1,28 @@
+# Render deployment configuration
+# https://render.com/docs/render-yaml
+
+services:
+  - type: web
+    name: shl-assessment-recommender
+    runtime: python
+    plan: free
+
+    # Build: install deps, then build FAISS index from the scraped catalog
+    buildCommand: |
+      pip install -r requirements.txt &&
+      python -c "from retriever.retriever import build_index; build_index()"
+
+    # Start: launch FastAPI with uvicorn on the Render-assigned PORT
+    startCommand: uvicorn api.main:app --host 0.0.0.0 --port $PORT
+
+    # Health check — Render pings this to verify the service is alive
+    # Must respond within 2 minutes on cold start
+    healthCheckPath: /health
+
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false          # Set this manually in the Render dashboard
+      - key: PYTHONUNBUFFERED
+        value: "1"           # Force stdout flushing for real-time logs
+      - key: PYTHONDONTWRITEBYTECODE
+        value: "1"

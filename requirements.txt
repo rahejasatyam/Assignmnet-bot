@@ -1,0 +1,25 @@
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+pydantic==2.7.1
+
+# Scraping
+requests==2.31.0
+beautifulsoup4==4.12.3
+lxml==5.2.1
+
+# Embeddings & Vector Store
+sentence-transformers==2.7.0
+faiss-cpu==1.8.0
+numpy==1.26.4
+
+# LLM
+groq==0.9.0
+
+# Utilities
+python-dotenv==1.0.1
+tqdm==4.66.4
+
+# Testing
+httpx==0.27.0
+pytest==8.2.0
+pytest-asyncio==0.23.6
